@@ -7,7 +7,7 @@ app = modal.App("musicgen-api")
 
 # Set up image with dependencies
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.debian_slim(python_version="3.10")
     .apt_install("git", "ffmpeg")
     .pip_install(
         "huggingface_hub[hf_transfer]==0.27.1",
