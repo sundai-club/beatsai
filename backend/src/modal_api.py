@@ -1,92 +1,107 @@
-from pathlib import Path
+import os
 import modal
-from typing import Optional
+from pathlib import Path
+import os
 
-# Create Modal app
-app = modal.App("musicgen-api")
+MODEL_DIR = "/model"
+DATA_DIR = "/data"
 
-# Set up image with dependencies
+# Create Modal stub
+app = modal.App(name="beatsai-api")
+
+# Set up Modal image
+image = modal.Image.debian_slim(python_version="3.10").pip_install(
+    "accelerate==0.31.0",
+    "datasets~=2.13.0",
+    "fastapi[standard]==0.115.4",
+    "ftfy~=6.1.0",
+    "huggingface-hub==0.26.2",
+    "hf_transfer==0.1.8",
+    "numpy<2",
+    "peft==0.11.1",
+    "pydantic==2.9.2",
+    "sentencepiece>=0.1.91,!=0.1.92",
+    "smart_open~=6.4.0",
+    "starlette==0.41.2",
+    "transformers~=4.41.2",
+    "torch~=2.2.0",
+    "triton~=2.2.0",
+    "wandb==0.17.6",
+    "python-multipart",
+    "scipy"
+)
+
+# Configure image
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git", "ffmpeg")
-    .pip_install(
-        "huggingface_hub[hf_transfer]==0.27.1",
-        "torch==2.1.0",
-        "numpy<2",
-        "git+https://github.com/facebookresearch/audiocraft.git@v1.3.0"
+    image.apt_install("git")
+    .run_commands(
+        "cd /root && git init .",
     )
 )
 
-# Create cache volume for model weights
-cache_dir = "/cache"
-model_cache = modal.Volume.from_name("musicgen-model-cache", create_if_missing=True)
+# Set up volume and secrets
+volume = modal.Volume.from_name("beatsai-model", create_if_missing=True)
+data_volume = modal.Volume.from_name("beatsai-volume", create_if_missing=True)
 
-@app.cls(gpu="l40s", image=image, volumes={cache_dir: model_cache})
-class MusicGenAPI:
-    @modal.enter()
-    def load_model(self):
-        from audiocraft.models import MusicGen
-        self.model = MusicGen.get_pretrained("facebook/musicgen-medium")
-        self.sample_rate = self.model.sample_rate
-        
-    @modal.method()
-    def generate_music(
-        self,
-        prompt: str,
-        duration: int = 10,
-        melody_path: Optional[str] = None
-    ) -> bytes:
-        """
-        Generate music based on text prompt and optional melody.
-        
-        Args:
-            prompt: Text description of desired music
-            duration: Duration in seconds (max 30)
-            melody_path: Optional path to melody audio file
-        
-        Returns:
-            Generated audio as bytes
-        """
-        import torch
-        import torchaudio
-        from audiocraft.data.audio import audio_write_from_tensor
-        
-        # Set generation parameters
-        self.model.set_generation_params(duration=min(duration, 30))
-        
-        if melody_path:
-            melody, sr = torchaudio.load(melody_path)
-            audio = self.model.generate_with_chroma(
-                [prompt],
-                melody[None].expand(1, -1, -1),
-                sr
-            )[0]
-        else:
-            audio = self.model.generate([prompt])[0]
-            
-        # Convert to audio bytes
-        audio_path = f"/tmp/{prompt[:10]}.wav"
-        audio_write_from_tensor(
-            audio_path, 
-            audio.cpu(),
-            self.sample_rate,
-            strategy="loudness",
-            loudness_compressor=True
-        )
-        
-        with open(audio_path, "rb") as f:
-            return f.read()
+image = image.env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 
-@app.local_entrypoint()
-def main():
-    api = MusicGenAPI()
-    # Example usage
-    audio_bytes = api.generate_music.remote(
-        prompt="Happy rock music with electric guitar",
-        duration=10
+
+@app.function(
+    volumes={MODEL_DIR: volume, DATA_DIR: data_volume},
+    image=image,
+    timeout=1800,
+)
+def download_models(config):
+    import torch
+    from transformers import pipeline
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        config.model_name,
+        local_dir=MODEL_DIR,
+        ignore_patterns=["*.pt", "*.bin"],
     )
-    
-    # Save output
-    output_path = Path("/tmp/output.wav")
-    output_path.write_bytes(audio_bytes)
-    print(f"Audio saved to {output_path}")
+
+    pipeline("text-to-audio", "facebook/musicgen-melody")
+
+    torch.cuda.empty_cache()
+
+@app.cls(image=image, gpu="A100", volumes={MODEL_DIR: volume, DATA_DIR: data_volume}, timeout=1800, keep_warm=2)
+class Model:
+
+    def __init__(self):
+        import logging
+        from transformers import pipeline
+        self.pipe = pipeline("text-to-audio", "facebook/musicgen-melody", device='cuda')
+        logging.info("Model loaded")
+
+
+    @modal.method()
+    def inference(self, prompt):
+        import scipy
+        import logging
+        import base64
+        import io
+        import torch
+        import os
+        import datetime
+        import time
+        os.makedirs(os.path.join(DATA_DIR, 'generated_audio'), exist_ok=True)
+        logging.info("Generating audio")
+
+        urls = []
+        with torch.no_grad():
+            music_data = self.pipe(
+                prompt,
+                forward_params={"do_sample": True,}
+
+            )
+
+        sample_rate = music_data["sampling_rate"]
+        audio = music_data["audio"]
+
+        return {
+            "sampling_rate": sample_rate,
+            "audio": base64.b64encode(audio.tobytes()).decode("utf-8"),
+        }
+        
