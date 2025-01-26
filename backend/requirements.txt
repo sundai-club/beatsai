@@ -1,0 +1,6 @@
+openai
+pydub
+fastapi
+uvicorn
+requests
+python-multipart
