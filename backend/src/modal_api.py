@@ -66,7 +66,7 @@ def download_models(config):
 
     torch.cuda.empty_cache()
 
-@app.cls(image=image, gpu="A100", volumes={MODEL_DIR: volume, DATA_DIR: data_volume}, timeout=1800, keep_warm=2)
+@app.cls(image=image, gpu="A100", volumes={MODEL_DIR: volume, DATA_DIR: data_volume}, timeout=1800, keep_warm=1)
 class Model:
 
     def __init__(self):
