@@ -10,12 +10,19 @@ import requests
 from src.openai_api import OpenAIAPI
 import base64
 import soundfile as sf
+import numpy as np
+from fastapi.responses import JSONResponse
+from pydub import AudioSegment
+from typing import List
 
+from fastapi import FastAPI, File, Form, UploadFile
+import tempfile
 import logging
-
+from scipy.io.wavfile import write
 logging.basicConfig(level=logging.INFO)
 
 openaiapi = OpenAIAPI()
+import json
 
 
 
@@ -49,53 +56,119 @@ async def get_beats(request: dict):
 
 
 @app.post("/get_soundtrack")
-async def get_soundtrack(files: list[UploadFile] = File(...)):
-    """
-    Overlays multiple WAV files into one soundtrack and returns it as base64-encoded audio data.
-
-    :param files: File uploads for the soundtrack of multiple WAV files
-    :return: JSON containing the sampling rate and base64-encoded audio data
-    """
-    if len(files) == 0:
-        return JSONResponse(content={"error": "No files uploaded."}, status_code=400)
-
-    file_paths = []
-    for file in files:
-        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
-        file_paths.append(file_path)
-
+async def combine_tracks(
+    metadata: str = Form(...),
+    audio_files: List[UploadFile] = File(...)
+):
     try:
-        if len(file_paths) == 1:
-            # Process the single file directly
-            data, sample_rate = sf.read(file_paths[0])
-        else:
-            # Overlay multiple files
-            combined_sound = overlay_wav_files(file_paths)
+        # Parse metadata
+        metadata = json.loads(metadata)
+        print("Received metadata:", metadata)
+        print(f"Received {len(audio_files)} audio files")
 
-            # Export combined sound to a BytesIO buffer
-            output = BytesIO()
-            combined_sound.export(output, format="wav")
-            output.seek(0)
+        # Create temporary directory for processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Process each audio file
+            processed_audio = []
+            sample_rate = 44100
 
-            # Read the combined audio from the buffer
-            data, sample_rate = sf.read(output)
+            for audio_file in audio_files:
+                # Get track ID from filename
+                file_id = audio_file.filename.split('_')[0]
+                
+                # Find corresponding metadata
+                track_meta = next(
+                    (m for m in metadata if m['track_id'] == file_id),
+                    None
+                )
 
-        # Convert the audio data to base64
-        audio_base64 = base64.b64encode(data.tobytes()).decode("utf-8")
+                if not track_meta:
+                    continue
 
-        return {
-            "sampling_rate": sample_rate,
-            "audio": audio_base64,
-        }
+                # Save temp file
+                temp_path = os.path.join(temp_dir, audio_file.filename)
+                with open(temp_path, "wb") as temp_file:
+                    content = await audio_file.read()
+                    temp_file.write(content)
+
+                try:
+                    # Load audio file
+                    audio = AudioSegment.from_file(temp_path)
+
+                    # Convert to mono
+                    if audio.channels > 1:
+                        audio = audio.set_channels(1)
+
+                    # Set sample rate
+                    if audio.frame_rate != sample_rate:
+                        audio = audio.set_frame_rate(sample_rate)
+
+                    # Apply volume (if not muted)
+                    volume = track_meta['volume']
+                    if volume > 0:
+                        if volume != 1.0:
+                            audio = audio.apply_gain(20 * np.log10(volume))
+                    else:
+                        continue  # Skip muted tracks
+
+                    # Convert to numpy array
+                    samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
+                    
+                    samples = samples / np.iinfo(np.int16).max  # Normalize to [-1, 1]
+
+                    processed_audio.append(samples)
+
+                except Exception as e:
+                    print(f"Error processing {audio_file.filename}: {str(e)}")
+                    continue
+
+            if not processed_audio:
+                return JSONResponse(
+                    status_code=422,
+                    content={"error": "No valid audio tracks to combine"}
+                )
+
+            # Pad and combine tracks
+            max_length = max(len(arr) for arr in processed_audio)
+            padded_audio = [
+                np.pad(arr, (0, max_length - len(arr)), 'constant')
+                for arr in processed_audio
+            ]
+
+            # Mix tracks
+            combined = np.sum(padded_audio, axis=0)
+
+            # Normalize to prevent clipping
+            if np.max(np.abs(combined)) > 1.0:
+                combined = combined / np.max(np.abs(combined))
+
+            # Convert to 16-bit PCM
+            combined = (combined * np.iinfo(np.int16).max).astype(np.int16)
+
+            # Write to WAV
+            with io.BytesIO() as wav_io:
+                sf.write(wav_io, combined, sample_rate, format='WAV')
+                wav_io.seek(0)
+                audio_data = wav_io.read()
+
+            # Encode as base64
+            audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+
+            # Save the audio to a WAV file
+            output_file = "output_audio.wav"
+            write(output_file, sample_rate, combined)
+
+            return {
+                "audio": audio_b64,
+                "sampling_rate": sample_rate
+            }
+
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-    finally:
-        # Cleanup uploaded files
-        for path in file_paths:
-            if os.path.exists(path):
-                os.remove(path)
+        print(f"Error combining tracks: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Server error: {str(e)}"}
+        )
 
 
 if __name__ == "__main__":
